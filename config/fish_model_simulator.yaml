@@ -1,0 +1,26 @@
+fish_model_params:
+  ALP0: 4
+  ALP1: 0.08
+  ALP2: 0
+  BET0: 0.02
+  BET1: 0.08
+  BET2: 0
+  GAM: 0.1
+  R: 0.25
+  V0: 0.5
+  field_size: 16384
+output_frame: simulator_origin
+clock_rate: 100.0
+sim_time_from_wall_time: true
+uav_names: [
+  "uav1",
+  "uav2",
+  "uav3",
+  "uav4",
+  "uav5",
+  "uav6",
+  "uav7",
+  "uav8",
+  "uav9",
+  "uav10",
+]

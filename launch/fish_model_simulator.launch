@@ -1,0 +1,13 @@
+<launch>
+
+  <group ns="fish_model_simulator">
+    <!-- <rosparam command="load" file="$(find fish_model_simulator)/config/fish_model_simulator.yaml" /> -->
+    <node name="fish_model_node" pkg="fish_model_simulator" type="fish_model" output="screen">
+      <param name="config" value="$(find fish_model_simulator)/config/fish_model_simulator.yaml" />
+      <remap from="/fish_model_simulator/fish_model_node/control_activation_in" to="/fish_model_simulator/activation" />
+    </node>
+  </group>
+
+
+</launch>
+

@@ -1,0 +1,10 @@
+<launch>
+
+  <group ns="fish_model_simulator">
+    <node name="filtration_node" pkg="fish_model_simulator" type="filtration" output="screen">
+      <param name="config" value="$(find fish_model_simulator)/config/filtration.yaml" />
+    </node>
+  </group>
+
+
+</launch>
