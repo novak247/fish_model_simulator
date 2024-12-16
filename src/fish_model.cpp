@@ -17,6 +17,7 @@
 #include <mrs_msgs/VelocityReferenceStampedSrv.h>
 #include <mrs_msgs/ReferenceStamped.h>
 #include <geometry_msgs/Vector3Stamped.h>
+#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Vector3.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <mrs_lib/transformer.h>
@@ -48,7 +49,8 @@ namespace fish_model {
 		ros::NodeHandle   nh_;
 		std::atomic<bool> is_initialized_;
 		// | ------------------------- params ------------------------- |
-
+    ros::Time last_timestamp_;
+    float dt_;
 		double  _simulation_rate_ = 100.0;
 
 		// | -------------- custom added -------------------------------|
@@ -60,12 +62,14 @@ namespace fish_model {
 		std::vector<ros::ServiceClient> client_vel_ref_arr;
 		std::vector<ros::Subscriber> uvdar_subscribers_;
 		std::vector<ros::Subscriber> velocity_subscribers;
+		ros::Subscriber position_subscriber;
 		void updateVelocities(void);
 
 		std::unordered_map<int, std::unordered_map<int, mrs_msgs::PoseWithCovarianceIdentified>> uav_poses_map;
     std::mutex uav_poses_mutex;
     std::condition_variable uav_poses_cv;
 		std::vector<geometry_msgs::Vector3Stamped> uav_velocity_msgs;
+		std::vector<Eigen::Vector3d> uav_positions;
     std::mutex uav_velocity_mutex;
 
 
@@ -77,6 +81,7 @@ namespace fish_model {
 		void uvdarCallback(const mrs_msgs::PoseWithCovarianceArrayStamped::ConstPtr& msg, const std::string& observer_name);
 		int extractIdFromName(const std::string& uav_name);
 		void velocityCallback(const geometry_msgs::Vector3Stamped::ConstPtr& msg);
+		void positionCallback(const geometry_msgs::PoseArray::ConstPtr& msg);
 		std::string extractUavNameFromFrameId(const std::string& frame_id);
     void waitForNonEmptyPoses();
     
@@ -155,11 +160,17 @@ namespace fish_model {
 			ros::Subscriber filter_sub = nh_.subscribe<geometry_msgs::Vector3Stamped>(
 				filter_topic_name, 10, &FishModelSimulator::velocityCallback, this);
 			velocity_subscribers.push_back(filter_sub);
+
 		}
-    uav_velocity_msgs.resize(uav_names.size());
-    transformer_ = mrs_lib::Transformer("FishModelTransformer");
+		std::string position_topic_name = "/multirotor_simulator/uav_poses";
+		position_subscriber = nh_.subscribe<geometry_msgs::PoseArray>(
+				position_topic_name, 10, &FishModelSimulator::positionCallback, this);
+		uav_velocity_msgs.resize(uav_names.size());
+		uav_positions.resize(uav_names.size());
+		
+		transformer_ = mrs_lib::Transformer("FishModelTransformer");
 		is_initialized_ = true;
-    		
+    last_timestamp_ = ros::Time(0);		
 	}
 
 	//}
@@ -207,13 +218,14 @@ namespace fish_model {
 		// Define variables
 		Eigen::VectorXd phi = Eigen::VectorXd::LinSpaced(field_size, -M_PI, M_PI);
 		bool send_message = false;
-		
-    std::lock_guard<std::mutex> lock(uav_velocity_mutex);
+			
+		std::lock_guard<std::mutex> lock(uav_velocity_mutex);
 		// For each UAV, update velocities
 		for (size_t i = 0; i < uav_names.size(); i++) {
 			// Retrieve current velocities and compute current heading and speed
 			geometry_msgs::Vector3Stamped uav_velocity = uav_velocity_msgs[i];  // velocity msg
-			auto input2output_tmp = transformer_.getTransform(uav_velocity.header.frame_id, output_frame_, uav_velocity.header.stamp-ros::Duration(0.2)); 
+			ROS_INFO_STREAM("UAV" << i+1 << "frame id" << uav_velocity.header.frame_id);
+			auto input2output_tmp = transformer_.getTransform(uav_velocity.header.frame_id, output_frame_, uav_velocity.header.stamp-ros::Duration(0.01)); 
 			if (!input2output_tmp){
 				ROS_ERROR_STREAM_THROTTLE(1.0,"[UVDARMultirobotSimulator]: Could not obtain transform from " << uav_velocity.header.frame_id<< " to " <<  output_frame_ << "!");
 				return;
@@ -233,14 +245,14 @@ namespace fish_model {
 			// Compute the visual field for the current UAV
 
 			Eigen::VectorXd visual_field = FishModelSimulator::compute_visual_field(heading, i, uav_names.size());
-      int vis_field_sum = visual_field.sum();
-      // ROS_INFO_STREAM("vis field sum:  "<< vis_field_sum);
+			int vis_field_sum = visual_field.sum();
+			// ROS_INFO_STREAM("vis field sum:  "<< vis_field_sum);
 			// Compute state variables dvel and dpsi
 			auto [dvel, dpsi] = FishModelSimulator::compute_state_variables(velocity, phi, visual_field);
 			// Update speed along the heading direction by integrating dvel over the time step
-			velocity += dvel ; //* _clock_min_dt_;
+			velocity += dvel * dt_ ; //* _clock_min_dt_;
 
-			heading += dpsi; 
+			heading += dpsi * dt_; 
 			// Compute new velocity components based on updated speed and heading
 			double vel_x_new = velocity * cos(heading);
 			double vel_y_new = velocity * sin(heading);
@@ -270,22 +282,16 @@ namespace fish_model {
 
 
 	Eigen::VectorXd FishModelSimulator::dPhi_V_of(const Eigen::VectorXd &Phi, const Eigen::VectorXd &V) {
-
     Eigen::VectorXd padV(V.size() + 2);
-
 		padV << V(V.size() - 1), V, V(0);
-
 		Eigen::VectorXd dPhi_V_raw = padV.tail(padV.size() - 1) - padV.head(padV.size() - 1);
-
 		if (dPhi_V_raw(0) > 0 && dPhi_V_raw(dPhi_V_raw.size() - 1) > 0) {
-      dPhi_V_raw.conservativeResize(dPhi_V_raw.size() - 1);
-
-		} else {
-			Eigen::VectorXd new_dPhi_V_raw = dPhi_V_raw.segment(1, dPhi_V_raw.size() - 1);
-      dPhi_V_raw = new_dPhi_V_raw;
-
-		}
-
+      Eigen::VectorXd new_dPhi_V_raw = dPhi_V_raw.head(dPhi_V_raw.size() - 1);
+			dPhi_V_raw = new_dPhi_V_raw;
+    } else {
+      Eigen::VectorXd new_dPhi_V_raw = dPhi_V_raw.tail(dPhi_V_raw.size() - 1);
+			dPhi_V_raw = new_dPhi_V_raw;
+    }
 		return dPhi_V_raw;
 	}
 
@@ -333,12 +339,14 @@ namespace fish_model {
         if (uav_poses_map.find(agent_index) != uav_poses_map.end() && 
             uav_poses_map[agent_index].find(j) != uav_poses_map[agent_index].end()) {
           mrs_msgs::PoseWithCovarianceIdentified pose_j = uav_poses_map[agent_index][j];
-          double xj = pose_j.pose.position.x; 
-          double yj = pose_j.pose.position.y;
+          double xj = pose_j.pose.position.x - uav_positions[j](0); 
+          double yj = pose_j.pose.position.y - uav_positions[j](1);
 
             // Calculate the distance between agent i and agent j
           double dij = sqrt(xj * xj + yj * yj);
-
+					if (dij < 1e-6) {
+						continue;
+					}
           // Calculate the relative angle between the agents
           double phij = atan2(yj, xj);
           // ROS_INFO_STREAM("agent index:  " << agent_index << "j:  " << j << "dij:  " << dij << "phij:  " << phij);
@@ -354,7 +362,7 @@ namespace fish_model {
               int idx = (center_j - half_angle_width + k + field_size) % field_size;
               visual_field[idx] = 1;
             }else{
-              ROS_ERROR("uav_i above or under uav_i");
+              ROS_ERROR("uav_ %d above or under uav_i %d", j, agent_index);
             }
           }
         }else{ // need to handle this properly, this is just a temporary solution
@@ -388,7 +396,13 @@ namespace fish_model {
 
 	void FishModelSimulator::uvdarCallback(const mrs_msgs::PoseWithCovarianceArrayStamped::ConstPtr& msg, const std::string& observer_name) {
 		int observer_id = extractIdFromName(observer_name);  // Assume a function to extract ID from the UAV name
-
+    if (observer_id == 1) {
+      ros::Time timestamp_now_ = msg->header.stamp;
+      // dt_ = (timestamp_now_ - last_timestamp_).toSec();
+			dt_ = 0.1;
+      // ROS_INFO_STREAM("dt: " << dt_);
+      last_timestamp_ = timestamp_now_;
+    }
 		// ROS_INFO("Received UVDAR poses for observer %s (ID %d)", observer_name.c_str(), observer_id);
     std::lock_guard<std::mutex> lock(uav_poses_mutex);
 		for (const auto& pose : msg->poses) {
@@ -409,6 +423,16 @@ namespace fish_model {
     uav_velocity_msgs[uav_id-1] = *msg;
 	}
 
+	void FishModelSimulator::positionCallback(const geometry_msgs::PoseArray::ConstPtr& msg){
+		// std::string frame_id = msg->header.frame_id;
+    // std::string uav_name = extractUavNameFromFrameId(frame_id);
+		// int uav_id = extractIdFromName(uav_name);
+    for (const auto& pose : msg->poses) {
+			Eigen::Vector3d pos(pose.position.x, pose.position.y, pose.position.z);
+			uav_positions.push_back(pos);
+		}
+	}
+
 	int FishModelSimulator::extractIdFromName(const std::string& uav_name) {
 		// Assuming UAV names are formatted as "uavX", where X is the ID
 		return std::stoi(uav_name.substr(3));
@@ -422,23 +446,23 @@ namespace fish_model {
     std::unique_lock<std::mutex> lock(uav_poses_mutex);
     // ROS_INFO_STREAM("UAV POSES MAP SIZE:  " << uav_poses_map.size() << "UAV NAMES SIZE:  " << uav_names.size());
     uav_poses_cv.wait(lock, [this]() {
-        // Check if the size of the map matches the expected number of observers
-        if (uav_poses_map.size() != uav_names.size()) {
-            return false;  // Not all observers are present in the map
+      // Check if the size of the map matches the expected number of observers
+      if (uav_poses_map.size() != uav_names.size()) {
+        return false;  // Not all observers are present in the map
+      }
+
+      // Iterate through the map to check if each observer has at least one target ID entry
+      for (const auto& observer_entry : uav_poses_map) {
+        const auto& target_map = observer_entry.second;
+
+        // Check if the target map for the observer is empty
+        if (target_map.empty()) {
+          return false;  // Condition not met if any observer's target map is empty
         }
+      }
 
-        // Iterate through the map to check if each observer has at least one target ID entry
-        for (const auto& observer_entry : uav_poses_map) {
-            const auto& target_map = observer_entry.second;
-
-            // Check if the target map for the observer is empty
-            if (target_map.empty()) {
-                return false;  // Condition not met if any observer's target map is empty
-            }
-        }
-
-        // If all conditions are met, return true to continue execution
-        return true;
+      // If all conditions are met, return true to continue execution
+      return true;
     });
 
     // Execution continues once the condition is satisfied
@@ -454,3 +478,4 @@ int main(int argc, char** argv) {
   fishModelSimulator.run();
   return 0;
 }
+  
