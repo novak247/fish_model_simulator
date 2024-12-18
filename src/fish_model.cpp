@@ -224,7 +224,7 @@ namespace fish_model {
 		for (size_t i = 0; i < uav_names.size(); i++) {
 			// Retrieve current velocities and compute current heading and speed
 			geometry_msgs::Vector3Stamped uav_velocity = uav_velocity_msgs[i];  // velocity msg
-			ROS_INFO_STREAM("UAV" << i+1 << "frame id" << uav_velocity.header.frame_id);
+			// ROS_INFO_STREAM("UAV" << i+1 << "frame id" << uav_velocity.header.frame_id);
 			auto input2output_tmp = transformer_.getTransform(uav_velocity.header.frame_id, output_frame_, uav_velocity.header.stamp-ros::Duration(0.01)); 
 			if (!input2output_tmp){
 				ROS_ERROR_STREAM_THROTTLE(1.0,"[UVDARMultirobotSimulator]: Could not obtain transform from " << uav_velocity.header.frame_id<< " to " <<  output_frame_ << "!");
@@ -339,8 +339,8 @@ namespace fish_model {
         if (uav_poses_map.find(agent_index) != uav_poses_map.end() && 
             uav_poses_map[agent_index].find(j) != uav_poses_map[agent_index].end()) {
           mrs_msgs::PoseWithCovarianceIdentified pose_j = uav_poses_map[agent_index][j];
-          double xj = pose_j.pose.position.x - uav_positions[j](0); 
-          double yj = pose_j.pose.position.y - uav_positions[j](1);
+          double xj = pose_j.pose.position.x - uav_positions[agent_index](0); 
+          double yj = pose_j.pose.position.y - uav_positions[agent_index](1);
 
             // Calculate the distance between agent i and agent j
           double dij = sqrt(xj * xj + yj * yj);

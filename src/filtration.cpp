@@ -15,7 +15,10 @@
 #include <deque>
 #include <Eigen/Dense>
 #include <std_srvs/Trigger.h>
-
+#include <geometry_msgs/PoseArray.h>
+#include <geometry_msgs/Vector3.h>
+#include <geometry_msgs/PointStamped.h>
+#include <nav_msgs/Odometry.h>
 
 namespace filtration {
 
@@ -54,6 +57,10 @@ namespace filtration {
       std::vector<ros::Publisher> filtered_pose_publishers_;
       std::vector<std::string> uav_names;
       ros::Time last_timestamp;
+      ros::Subscriber position_subscriber;
+      std::vector<ros::Subscriber> odom_subscribers;
+      std::vector<Eigen::Vector3d> odom_positions;
+      std::vector<Eigen::Vector3d> uav_positions;
 
       // UKF-specific variables
       std::unordered_map<int, std::unordered_map<int, statecov_t>> ukf_map_;
@@ -68,6 +75,7 @@ namespace filtration {
       double q_vel;
       double q_pos;
       double q_ori;
+      double last_callback_time_;
       
       // activation service
       ros::ServiceServer service_activate_filtration_;
@@ -75,6 +83,12 @@ namespace filtration {
       // fish model variables
       VisualFieldParams params;
       bool filtration_allowed_ = false;
+
+      std::ofstream predicted_file_, measured_file_, groundtruth_file_;
+      bool files_initialized_ = false;
+      double timestamp;
+
+		  mrs_lib::Transformer transformer_;
 
     public:
       PoseFiltration(ros::NodeHandle& nh) : nh_(nh),
@@ -86,7 +100,14 @@ namespace filtration {
         loadParameters();
         initializeSubscribersAndPublishers();
         setupProcessNoise();
+        initializeFiles();
+        last_callback_time_ = getCurrentTimeAsDouble();
+        transformer_ = mrs_lib::Transformer("FiltrationTransformer");
         service_activate_filtration_ = nh_.advertiseService("filtration_activation_in", &PoseFiltration::activationServiceCallback, this);
+      }
+
+      ~PoseFiltration() {
+        closeFiles();
       }
 
           // Transition model
@@ -96,7 +117,7 @@ namespace filtration {
         // Extract current state variables
         double x = state(0), y = state(1), z = state(2), psi = state(8), v = state(9);
         double heading = atan2(state(4), state(3));
-        Eigen::VectorXd visual_field = compute_visual_field(heading, all_states_, params);
+        Eigen::VectorXd visual_field = compute_visual_field(heading, all_states_, params, current_agent_id_);
         // int vis_field_sum = visual_field.sum();
         Eigen::VectorXd phi = Eigen::VectorXd::LinSpaced(params.field_size, -M_PI, M_PI);
         auto [dvel, dpsi] = compute_state_variables(v, phi, visual_field, params);
@@ -133,12 +154,17 @@ namespace filtration {
         return observation;
       }
 
-      Eigen::VectorXd compute_visual_field(double heading, std::vector<x_t> all_states_, const VisualFieldParams& params) {
+      Eigen::VectorXd compute_visual_field(double heading, std::vector<x_t> all_states_, const VisualFieldParams& params, int agent_index) {
         Eigen::VectorXd visual_field = Eigen::VectorXd::Zero(params.field_size);
-
-        for (const auto& state_j : all_states_) {
-          double xj = state_j(0);
-          double yj = state_j(1);
+        for (int j = 0; j < uav_names.size(); j++) {
+          if (j == agent_index) {
+            continue;
+          }
+          const auto& state_j = all_states_[j];
+          double xj = state_j(0) - odom_positions[agent_index](0);
+          double yj = state_j(1) - odom_positions[agent_index](1);
+          ROS_INFO_STREAM(odom_positions[agent_index]);
+          
           double dij = sqrt(xj * xj + yj * yj);
           if (dij < 1e-6) {
             continue;
@@ -233,7 +259,7 @@ namespace filtration {
 
       void setupProcessNoise() {
         // Initialize process noise matrix (Q)
-        process_noise_.setZero();
+        process_noise_ = Q_t::Zero();
 
         // Position noise (x, y, z)
         process_noise_(0, 0) = q_pos;  // Variance in x position
@@ -264,12 +290,33 @@ namespace filtration {
           std::string pub_topic_name = "/" + uav_name + "/uvdar/filteredPoses";
           ros::Publisher pub = nh_.advertise<mrs_msgs::PoseWithCovarianceArrayStamped>(pub_topic_name, 1);
           filtered_pose_publishers_.push_back(pub);
+
+          std::string odom_topic_name = "/" + uav_name + "/estimation_manager/odom_main";
+          ros::Subscriber odom_sub = nh_.subscribe<nav_msgs::Odometry>(
+              odom_topic_name, 1000, boost::bind(&PoseFiltration::odomCallback, this, _1, uav_name));
+          odom_subscribers.push_back(odom_sub);
         }
+        std::string position_topic_name = "/multirotor_simulator/uav_poses";
+        position_subscriber = nh_.subscribe<geometry_msgs::PoseArray>(
+            position_topic_name, 10, &PoseFiltration::positionCallback, this);
+        uav_positions.resize(uav_names.size());
+        odom_positions.resize(uav_names.size(), Eigen::Vector3d::Zero());
+
+      }
+
+      void odomCallback(const nav_msgs::Odometry::ConstPtr& msg, const std::string& observer_name) {
+        int observer_id = extractIdFromName(observer_name)-1;
+        Eigen::Vector3d position;
+        position(0) = msg->pose.pose.position.x;
+        position(1) = msg->pose.pose.position.y;
+        position(2) = msg->pose.pose.position.z;
+        odom_positions[observer_id] = position;
       }
 
       void uvdarCallback(const mrs_msgs::PoseWithCovarianceArrayStamped::ConstPtr& msg, const std::string& observer_name) {
         int observer_id = extractIdFromName(observer_name)-1;
         // double dt = (ros::Time::now() - last_timestamp).toSec();
+        timestamp = getCurrentTimeAsDouble();
         double dt = 0.1;
         // ROS_INFO_STREAM("[PoseFiltration]: dt "<< dt);
         last_timestamp = ros::Time::now();
@@ -280,6 +327,10 @@ namespace filtration {
         // Store all received measurements in a map
         std::unordered_map<int, mrs_msgs::PoseWithCovarianceIdentified> measurements;
         for (const auto& pose : msg->poses) {
+          // mrs_msgs::PoseWithCovarianceIdentified modified_pose = pose;
+          // modified_pose.pose.position.x -= uav_positions[observer_id](0);    
+          // modified_pose.pose.position.y -= uav_positions[observer_id](1); 
+          // modified_pose.pose.position.z -= uav_positions[observer_id](2);       
           measurements[pose.id-1] = pose;
         }
         all_states_.clear();
@@ -291,7 +342,7 @@ namespace filtration {
           } else {
               all_states_[target_id] = x_t::Zero(); // Set to zero if the target state is not initialized
           }
-      }
+        }
         
         // std::vector<x_t> all_states_backup = all_states_;
         // Loop through all possible target IDs
@@ -306,8 +357,11 @@ namespace filtration {
           //   all_states_ = transformed_states;
           // }
           // If a measurement exists, predict and correct
+          
+          current_agent_id_ = target_id;
           if (measurements.find(target_id) != measurements.end() && filtration_allowed_) {
             const auto& pose = measurements[target_id];
+            logMeasured(observer_id, target_id, pose.pose, timestamp);
             ukf_map_[observer_id][target_id] = predictAndCorrect(observer_id, target_id, pose, dt);
           } else {
             // No measurement: only predict
@@ -315,13 +369,18 @@ namespace filtration {
             if (filtration_allowed_) {  
               try {
                 ukf_map_[observer_id][target_id] = ukf_.predict(ukf_map_[observer_id][target_id], ukf_t::u_t::Zero(), process_noise_, dt);
-                // ROS_INFO_STREAM("Current UKF state covariance is:" << ukf_map_[observer_id][target_id].P);
               } catch (const std::exception& e) {
                 ROS_ERROR("[PoseFiltration]: UKF correction failed for observer %d, target %ld: %s", observer_id, target_id, e.what());
               }  
             }
           }
-
+          
+          if (filtration_allowed_) {  
+            logPredicted(observer_id, target_id, ukf_map_[observer_id][target_id].x, timestamp);
+            logGroundTruth(target_id, odom_positions[target_id], timestamp);
+          }
+          
+          
           // Add the filtered state to the outgoing message
           mrs_msgs::PoseWithCovarianceIdentified filtered_pose = getFilteredPose(observer_id, target_id);
           filtered_msg.poses.push_back(filtered_pose);
@@ -329,12 +388,33 @@ namespace filtration {
           // all_states_.resize(uav_names.size(), x_t::Zero());
           // all_states_ = all_states_backup;
         }
+        // ROS_INFO_STREAM("Current UKF state covariance of uav 1 is:" << std::endl << ukf_map_[observer_id][0].P);
+
 
         // Publish the filtered message
-        auto observer_index = std::distance(uav_names.begin(), std::find(uav_names.begin(), uav_names.end(), observer_name));
-        if (observer_index < filtered_pose_publishers_.size()) {
-          filtered_pose_publishers_[observer_index].publish(filtered_msg);
-        }
+        // auto observer_index = std::distance(uav_names.begin(), std::find(uav_names.begin(), uav_names.end(), observer_name));
+        // if (observer_index < filtered_pose_publishers_.size()) {
+        //   filtered_pose_publishers_[observer_index].publish(filtered_msg);
+        // }
+        filtered_pose_publishers_[observer_id].publish(filtered_msg);
+      }
+
+      void positionCallback(const geometry_msgs::PoseArray::ConstPtr& msg){
+        // std::string frame_id = msg->header.frame_id;
+        // std::string uav_name = extractUavNameFromFrameId(frame_id);
+        // int uav_id = extractIdFromName(uav_name);
+        
+        double now = getCurrentTimeAsDouble();
+        last_callback_time_ = now;
+        int id = 0;
+        for (const auto& pose : msg->poses) {
+          Eigen::Vector3d pos;
+          pos(0) = pose.position.x;
+          pos(1) = pose.position.y;
+          pos(2) = pose.position.z;
+          uav_positions[id] = (pos);
+          id++;
+        } 
       }
 
       statecov_t predictAndCorrect(int observer_id, int target_id, const mrs_msgs::PoseWithCovarianceIdentified& pose, double dt) {
@@ -391,7 +471,11 @@ namespace filtration {
       void initializeUKF(int observer_id, int target_id, const std::vector<Position>& initial_positions) {
         if (ukf_map_[observer_id].find(target_id) == ukf_map_[observer_id].end()) {
           x_t x0 = x_t::Zero();
-          ukf_t::P_t P0 = ukf_t::P_t::Identity() * 1e-3;  
+          ukf_t::P_t P0 = ukf_t::P_t::Identity();  
+          P0(0, 0) = 0.01;
+          P0(1, 1) = 0.01;
+          P0(2, 2) = 0.01;
+
           if (target_id < initial_positions.size()) {
             // x0(0) = initial_positions[target_id].x - initial_positions[observer_id].x;
             // x0(1) = initial_positions[target_id].y - initial_positions[observer_id].y;
@@ -529,6 +613,60 @@ namespace filtration {
       euler_angles(2) = std::atan2(rotation_matrix(1, 0), rotation_matrix(0, 0));
 
       return euler_angles;
+    }
+
+    void initializeFiles() {
+      std::string package_path = ros::package::getPath("fish_model_simulator");
+      predicted_file_.open(package_path + "/predicted_positions.csv");
+      measured_file_.open(package_path + "/measured_positions.csv");
+      groundtruth_file_.open(package_path + "/groundtruth_positions.csv");
+      if (predicted_file_.is_open() && measured_file_.is_open() && groundtruth_file_.is_open()) {
+        files_initialized_ = true;
+        predicted_file_ << "timestamp,obsv_id,target_id,x,y,z\n";
+        measured_file_ << "timestamp,obsv_id,target_id,x,y,z\n";
+        groundtruth_file_ << "timestamp,id,x,y,z\n";
+      } else {
+        ROS_ERROR("[PoseFiltration]: Failed to open output files for logging");
+      }
+    }
+
+    void closeFiles() {
+      if (predicted_file_.is_open()) {
+        predicted_file_.close();
+      }
+      if (measured_file_.is_open()) {
+        measured_file_.close();
+      }
+      if (groundtruth_file_.is_open()) {
+        groundtruth_file_.close();
+      }
+      ROS_INFO("[PoseFiltration]: Output files successfully closed.");
+    }
+
+    void logPredicted(int observer_id, int target_id, const x_t& state, double timestamp) {
+      if (files_initialized_) {
+        predicted_file_ << std::fixed << std::setprecision(9) << timestamp << "," << observer_id << "," << target_id << ","
+                        << state(0) << "," << state(1) << "," << state(2) << "\n";
+      }
+    }
+
+    void logMeasured(int observer_id, int target_id, const geometry_msgs::Pose& pose, double timestamp) {
+      if (files_initialized_) {
+        measured_file_ << std::fixed << std::setprecision(9) << timestamp << "," << observer_id << "," << target_id << ","
+                        << pose.position.x << "," << pose.position.y << "," << pose.position.z << "\n";
+      }
+    }
+
+    void logGroundTruth(int id, const Eigen::Vector3d& position, double timestamp) {
+      if (files_initialized_) {
+        groundtruth_file_ << std::fixed << std::setprecision(9) << timestamp << "," << id << ","
+                          << position(0) << "," << position(1) << "," << position(2) << "\n";
+      }
+    }
+    
+    double getCurrentTimeAsDouble() {
+      ros::Time current_time = ros::Time::now();
+      return current_time.sec + current_time.nsec * 1e-9;
     }
     
   };

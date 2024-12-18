@@ -16,16 +16,16 @@ filtration_params:
   q_ori: 0.25
 history_size: 2
 fish_model_params:
-  ALP0: 2
+  ALP0: 1
   ALP1: 0.09
   ALP2: 0
-  BET0: 0.02
+  BET0: 0.04
   BET1: 0.09
   BET2: 0
   GAM: 0.1
   R: 0.5
   V0: 1
-  field_size: 2048
+  field_size: 1024
 
 uav1:
   spawn:
